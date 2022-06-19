@@ -1,155 +1,124 @@
-type OwnerResult = variant {
-    Err : ApiError;
-    Ok : principal;
+type GenericValue = variant {
+  Nat64Content : nat64;
+  Nat32Content : nat32;
+  BoolContent : bool;
+  Nat8Content : nat8;
+  Int64Content : int64;
+  IntContent : int;
+  NatContent : nat;
+  Nat16Content : nat16;
+  Int32Content : int32;
+  Int8Content : int8;
+  FloatContent : float64;
+  Int16Content : int16;
+  BlobContent : vec nat8;
+  NestedContent : Vec;
+  Principal : principal;
+  TextContent : text;
 };
-type ApiError = variant {
-    Unauthorized;
-    InvalidTokenId;
-    ZeroAddress;
-    Other;
-};
-type TxReceipt = variant {
-    Ok : nat;
-    Err : ApiError;
-};
-type InterfaceId = variant {
-    Approval;
-    TransactionHistory;
-    Mint;
-    Burn;
-    TransferNotification;
-};
-type LogoResult = record {
-    logo_type : text;
-    data : text;
-};
-type ExtendedMetadataResult = record {
-    metadata_desc : MetadataDesc;
-    token_id : nat64;
-};
-type MetadataResult = variant {
-    Ok : MetadataDesc;
-    Err : ApiError;
-};
-type MetadataDesc = vec MetadataPart;
-type MetadataPart = record {
-    purpose : MetadataPurpose;
-    key_val_data : vec MetadataKeyVal;
-    data : blob;
-};
-type MetadataPurpose = variant {
-    Preview;
-    Rendered;
-};
-type MetadataKeyVal = record {
-    text;
-    MetadataVal;
-};
-type MetadataVal = variant {
-    TextContent : text;
-    BlobContent : blob;
-    NatContent : nat;
-    Nat8Content : nat8;
-    Nat16Content : nat16;
-    Nat32Content : nat32;
-    Nat64Content : nat64;
-};
-type TxResult = record { // ???
-    fee : nat;
-    transaction_type : TransactionType;
-};
-type TransactionType = variant {
-    Transfer : record {
-        token_id : nat64;
-        from : principal;
-        to : principal;
-    };
-    TransferFrom : record {
-        token_id : nat64;
-        from : principal;
-        to : principal;
-    };
-    Approve : record {
-        token_id : nat64;
-        from : principal;
-        to : principal;
-    };
-    SetApprovalForAll : record {
-        from : principal;
-        to : principal;
-    };
-    Mint : record {
-        token_id : nat64;
-    };
-    Burn : record {
-        token_id : nat64;
-    };
-};
-
-type MintReceipt = variant {
-    Err : variant {
-        Unauthorized;
-    };
-    Ok : record {
-        token_id : nat64;
-        id : nat;
-    };
-};
-
-type BurnRequest = record {
-    token_id : nat64;
-};
-
 type InitArgs = record {
-    custodians : opt vec principal;
-    logo : opt LogoResult;
-    name : text;
-    symbol : text;
+  cap : opt principal;
+  logo : opt text;
+  name : opt text;
+  custodians : opt vec principal;
+  symbol : opt text;
 };
-
-type ManageResult = variant {
-    Ok;
-    Err : ApiError;
+type ManualReply = record {
+  logo : opt text;
+  name : opt text;
+  created_at : nat64;
+  upgraded_at : nat64;
+  custodians : vec principal;
+  symbol : opt text;
 };
-
-type HttpRequest = record {
-    method : text;
-    url : text;
-    headers : vec record { text; text; };
-    body : blob;
+type ManualReply_1 = variant { Ok : vec nat; Err : NftError };
+type ManualReply_2 = variant { Ok : vec TokenMetadata; Err : NftError };
+type ManualReply_3 = variant { Ok : TokenMetadata; Err : NftError };
+type NftError = variant {
+  UnauthorizedOperator;
+  SelfTransfer;
+  TokenNotFound;
+  UnauthorizedOwner;
+  SelfApprove;
+  OperatorNotFound;
+  ExistedNFT;
+  OwnerNotFound;
 };
-
-type HttpResponse = record {
-    status_code : nat16;
-    headers : vec record { text; text; };
-    body : blob;
+type Result = variant { Ok : nat; Err : NftError };
+type Result_1 = variant { Ok : bool; Err : NftError };
+type Result_2 = variant { Ok : opt principal; Err : NftError };
+type Stats = record {
+  cycles : nat;
+  total_transactions : nat;
+  total_unique_holders : nat;
+  total_supply : nat;
 };
-
-service : (InitArgs) -> {
-    balanceOfDip721 : (user : principal) -> (nat64) query;
-    ownerOfDip721 : (token_id : nat64) -> (OwnerResult) query;
-    safeTransferFromDip721 : (from : principal, to : principal, token_id : nat64) -> (TxReceipt);
-    transferFromDip721 : (from : principal, to : principal, token_id : nat64) -> (TxReceipt);
-    supportedInterfacesDip721 : () -> (vec InterfaceId) query;
-    logoDip721 : () -> (LogoResult) query;
-    nameDip721 : () -> (text) query;
-    symbolDip721 : () -> (text) query;
-    totalSupplyDip721 : () -> (nat64) query;
-    getMetadataDip721 : (token_id : nat64) -> (MetadataResult) query;
-    getMetdataForUserDip721 : (user : principal) -> (vec ExtendedMetadataResult); 
-    safeTransferFromNotifyDip721 : (from : principal, to : principal, token_id : nat64, data : vec nat8) -> (TxReceipt);
-    transferFromNotifyDip721 : (from : principal, to : principal, token_id : nat64, data : vec nat8) -> (TxReceipt);
-    approveDip721 : (user : principal, token_id : nat64) -> (TxReceipt) /*query*/;
-    setApprovalForAllDip721 : (operator : principal, isApproved : bool) -> (TxReceipt);
-    getApprovedDip721 : (token_id : nat64) -> (TxReceipt) query;
-    isApprovedForAllDip721 : (operator : principal) -> (bool) query;
-    mintDip721 : (to : principal, metadata : MetadataDesc, blobContent : blob) -> (MintReceipt);
-    burnDip721 : (token_id : nat64) -> (TxReceipt);
-
-    set_name : (name : text) -> (ManageResult);
-    set_symbol : (sym : text) -> (ManageResult);
-    set_logo : (logo : opt LogoResult) -> (ManageResult);
-    set_custodian : (user : principal, custodian : bool) -> (ManageResult);
-    is_custodian : (principal) -> (bool) query;
-    http_request : (HttpRequest) -> (HttpResponse) query;
+type SupportedInterface = variant { Burn; Mint; Approval };
+type TokenMetadata = record {
+  transferred_at : opt nat64;
+  transferred_by : opt principal;
+  owner : opt principal;
+  operator : opt principal;
+  approved_at : opt nat64;
+  approved_by : opt principal;
+  properties : vec record { text; GenericValue };
+  is_burned : bool;
+  token_identifier : nat;
+  burned_at : opt nat64;
+  burned_by : opt principal;
+  minted_at : nat64;
+  minted_by : principal;
+};
+type Vec = vec record {
+  text;
+  variant {
+    Nat64Content : nat64;
+    Nat32Content : nat32;
+    BoolContent : bool;
+    Nat8Content : nat8;
+    Int64Content : int64;
+    IntContent : int;
+    NatContent : nat;
+    Nat16Content : nat16;
+    Int32Content : int32;
+    Int8Content : int8;
+    FloatContent : float64;
+    Int16Content : int16;
+    BlobContent : vec nat8;
+    NestedContent : Vec;
+    Principal : principal;
+    TextContent : text;
+  };
+};
+service : (opt InitArgs) -> {
+  approve : (principal, nat) -> (Result);
+  balanceOf : (principal) -> (Result) query;
+  burn : (nat) -> (Result);
+  custodians : () -> (vec principal) query;
+  cycles : () -> (nat) query;
+  isApprovedForAll : (principal, principal) -> (Result_1) query;
+  logo : () -> (opt text) query;
+  metadata : () -> (ManualReply) query;
+  mint : (principal, nat, vec record { text; GenericValue }) -> (Result);
+  name : () -> (opt text) query;
+  operatorOf : (nat) -> (Result_2) query;
+  operatorTokenIdentifiers : (principal) -> (ManualReply_1) query;
+  operatorTokenMetadata : (principal) -> (ManualReply_2) query;
+  ownerOf : (nat) -> (Result_2) query;
+  ownerTokenIdentifiers : (principal) -> (ManualReply_1) query;
+  ownerTokenMetadata : (principal) -> (ManualReply_2) query;
+  setApprovalForAll : (principal, bool) -> (Result);
+  setCustodians : (vec principal) -> ();
+  setLogo : (text) -> ();
+  setName : (text) -> ();
+  setSymbol : (text) -> ();
+  stats : () -> (Stats) query;
+  supportedInterfaces : () -> (vec SupportedInterface) query;
+  symbol : () -> (opt text) query;
+  tokenMetadata : (nat) -> (ManualReply_3) query;
+  totalSupply : () -> (nat) query;
+  totalTransactions : () -> (nat) query;
+  totalUniqueHolders : () -> (nat) query;
+  transfer : (principal, nat) -> (Result);
+  transferFrom : (principal, principal, nat) -> (Result);
 }

@@ -6,10 +6,7 @@
       "candid": "uamagicals-nft-container.did",
       "package": "uamagicals_nft_container"
     },
-    "nft_0": {
-      "dependencies": [
-        "uamagicals_nft_container"
-      ],
+    "nft_assets": {
       "source": [
         "assets"
       ],

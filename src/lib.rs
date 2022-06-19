@@ -1,552 +1,839 @@
-#![allow(clippy::collapsible_else_if)]
+use cap_sdk::{handshake, insert_sync, DetailValue, IndefiniteEvent};
+use ic_cdk::api::call::ManualReply;
+use ic_cdk::api::{caller, canister_balance128, time, trap};
+use ic_cdk::export::candid::{candid_method, CandidType, Deserialize, Int, Nat};
+use ic_cdk::export::Principal;
+use ic_cdk_macros::{init, post_upgrade, pre_upgrade, query, update};
 
-#[macro_use]
-extern crate ic_cdk_macros;
-#[macro_use]
-extern crate serde;
-
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
-use std::iter::FromIterator;
-use std::mem;
-use std::num::TryFromIntError;
-use std::result::Result as StdResult;
-
-use candid::{CandidType, Encode, Principal};
-use ic_cdk::{
-  api::{self, call},
-  export::candid,
-  storage,
-};
-use ic_certified_map::Hash;
-use include_base64::include_base64;
+use std::ops::Not;
+use types::*;
 
 mod http;
 
-const MGMT: Principal = Principal::from_slice(&[]);
-
-thread_local! {
-    static STATE: RefCell<State> = RefCell::default();
+mod types {
+    use super::*;
+    #[derive(CandidType, Deserialize)]
+    pub struct InitArgs {
+        pub name: Option<String>,
+        pub logo: Option<String>,
+        pub symbol: Option<String>,
+        pub custodians: Option<HashSet<Principal>>,
+        pub cap: Option<Principal>,
+    }
+    #[derive(CandidType, Default, Deserialize)]
+    pub struct Metadata {
+        pub name: Option<String>,
+        pub logo: Option<String>,
+        pub symbol: Option<String>,
+        pub custodians: HashSet<Principal>,
+        pub created_at: u64,
+        pub upgraded_at: u64,
+    }
+    #[derive(CandidType)]
+    pub struct Stats {
+        pub total_transactions: Nat,
+        pub total_supply: Nat,
+        pub cycles: Nat,
+        pub total_unique_holders: Nat,
+    }
+    pub type TokenIdentifier = Nat;
+    #[derive(CandidType, Deserialize, Debug)]
+    pub enum GenericValue {
+        BoolContent(bool),
+        TextContent(String),
+        BlobContent(Vec<u8>),
+        Principal(Principal),
+        Nat8Content(u8),
+        Nat16Content(u16),
+        Nat32Content(u32),
+        Nat64Content(u64),
+        NatContent(Nat),
+        Int8Content(i8),
+        Int16Content(i16),
+        Int32Content(i32),
+        Int64Content(i64),
+        IntContent(Int),
+        FloatContent(f64), // motoko only support f64
+        NestedContent(Vec<(String, GenericValue)>),
+    }
+    /// Please notice that the example of internal data structure as below doesn't represent your final storage, please use with caution.
+    /// Feel free to change the storage and behavior that align with your expected business.
+    /// The canister should match with the signature defined in `spec.md` in order to be considered as a DIP721 contract.
+    #[derive(CandidType, Deserialize)]
+    pub struct TokenMetadata {
+        pub token_identifier: TokenIdentifier,
+        pub owner: Option<Principal>,
+        pub operator: Option<Principal>,
+        pub is_burned: bool,
+        pub properties: Vec<(String, GenericValue)>,
+        pub minted_at: u64,
+        pub minted_by: Principal,
+        pub transferred_at: Option<u64>,
+        pub transferred_by: Option<Principal>,
+        pub approved_at: Option<u64>,
+        pub approved_by: Option<Principal>,
+        pub burned_at: Option<u64>,
+        pub burned_by: Option<Principal>,
+    }
+    #[derive(CandidType)]
+    pub enum SupportedInterface {
+        Approval,
+        Mint,
+        Burn,
+    }
+    #[derive(CandidType)]
+    pub enum NftError {
+        UnauthorizedOwner,
+        UnauthorizedOperator,
+        OwnerNotFound,
+        OperatorNotFound,
+        TokenNotFound,
+        ExistedNFT,
+        SelfApprove,
+        SelfTransfer,
+        // Other(String), // for debugging
+    }
 }
 
-#[derive(CandidType, Deserialize)]
-struct StableState {
-  state: State,
-  hashes: Vec<(String, Hash)>,
-}
+mod ledger {
+    use super::*;
+    thread_local!(
+        static LEDGER: RefCell<Ledger> = RefCell::new(Ledger::default());
+    );
 
-#[pre_upgrade]
-fn pre_upgrade() {
-  let state = STATE.with(|state| mem::take(&mut *state.borrow_mut()));
-  let hashes = http::HASHES.with(|hashes| mem::take(&mut *hashes.borrow_mut()));
-  let hashes = hashes.iter().map(|(k, v)| (k.clone(), *v)).collect();
-  let stable_state = StableState { state, hashes };
-  storage::stable_save((stable_state,)).unwrap();
-}
-#[post_upgrade]
-fn post_upgrade() {
-  let (StableState { state, hashes },) = storage::stable_restore().unwrap();
-  STATE.with(|state0| *state0.borrow_mut() = state);
-  let hashes = hashes.into_iter().collect();
-  http::HASHES.with(|hashes0| *hashes0.borrow_mut() = hashes);
-}
+    pub fn with<T, F: FnOnce(&Ledger) -> T>(f: F) -> T {
+        LEDGER.with(|ledger| f(&ledger.borrow()))
+    }
 
-#[derive(CandidType, Deserialize)]
-struct InitArgs {
-  custodians: Option<HashSet<Principal>>,
-  logo: Option<LogoResult>,
-  name: String,
-  symbol: String,
+    pub fn with_mut<T, F: FnOnce(&mut Ledger) -> T>(f: F) -> T {
+        LEDGER.with(|ledger| f(&mut ledger.borrow_mut()))
+    }
+
+    #[derive(CandidType, Default, Deserialize)]
+    pub struct Ledger {
+        pub metadata: Metadata,
+        pub tokens: HashMap<TokenIdentifier, TokenMetadata>, // recommend to have sequential id
+        pub owners: HashMap<Principal, HashSet<TokenIdentifier>>, // quick lookup
+        pub operators: HashMap<Principal, HashSet<TokenIdentifier>>, // quick lookup
+        pub tx_count: Nat,
+    }
+
+    impl Ledger {
+        pub fn init_metadata(&mut self, default_custodian: Principal, args: Option<InitArgs>) {
+            let metadata = self.metadata_mut();
+            metadata.custodians.insert(default_custodian);
+            if let Some(args) = args {
+                metadata.name = args.name;
+                metadata.logo = args.logo;
+                metadata.symbol = args.symbol;
+                if let Some(custodians) = args.custodians {
+                    for custodians in custodians {
+                        metadata.custodians.insert(custodians);
+                    }
+                }
+
+                // initiate cap with specified canister, otherwise use mainnet canister
+                handshake(1_000_000_000_000, args.cap);
+            } else {
+                // default to mainnet cap canister if no args are specified
+                handshake(1_000_000_000_000, None);
+            }
+            metadata.created_at = time();
+            metadata.upgraded_at = time();
+        }
+
+        pub fn metadata(&self) -> &Metadata {
+            &self.metadata
+        }
+
+        pub fn metadata_mut(&mut self) -> &mut Metadata {
+            &mut self.metadata
+        }
+
+        pub fn tokens_count(&self) -> usize {
+            self.tokens.len()
+        }
+
+        pub fn tx_count(&self) -> Nat {
+            self.tx_count.clone()
+        }
+
+        pub fn is_token_existed(&self, token_identifier: &TokenIdentifier) -> bool {
+            self.tokens.contains_key(token_identifier)
+        }
+
+        pub fn token_metadata(
+            &self,
+            token_identifier: &TokenIdentifier,
+        ) -> Result<&TokenMetadata, NftError> {
+            self.tokens
+                .get(token_identifier)
+                .ok_or(NftError::TokenNotFound)
+        }
+
+        pub fn add_token_metadata(
+            &mut self,
+            token_identifier: TokenIdentifier,
+            token_metadata: TokenMetadata,
+        ) {
+            self.tokens.insert(token_identifier, token_metadata);
+        }
+
+        pub fn owners_count(&self) -> usize {
+            self.owners.len()
+        }
+
+        pub fn owner_token_identifiers(
+            &self,
+            owner: &Principal,
+        ) -> Result<&HashSet<TokenIdentifier>, NftError> {
+            self.owners.get(owner).ok_or(NftError::OwnerNotFound)
+        }
+
+        pub fn owner_of(
+            &self,
+            token_identifier: &TokenIdentifier,
+        ) -> Result<Option<Principal>, NftError> {
+            self.token_metadata(token_identifier)
+                .map(|token_metadata| token_metadata.owner)
+        }
+
+        pub fn owner_token_metadata(
+            &self,
+            owner: &Principal,
+        ) -> Result<Vec<&TokenMetadata>, NftError> {
+            self.owner_token_identifiers(owner)?
+                .iter()
+                .map(|token_identifier| self.token_metadata(token_identifier))
+                .collect()
+        }
+
+        pub fn update_owner_cache(
+            &mut self,
+            token_identifier: &TokenIdentifier,
+            old_owner: Option<Principal>,
+            new_owner: Option<Principal>,
+        ) {
+            if let Some(old_owner) = old_owner {
+                let old_owner_token_identifiers = self
+                    .owners
+                    .get_mut(&old_owner)
+                    .expect("couldn't find owner");
+                old_owner_token_identifiers.remove(token_identifier);
+                if old_owner_token_identifiers.is_empty() {
+                    self.owners.remove(&old_owner);
+                }
+            }
+            if let Some(new_owner) = new_owner {
+                self.owners
+                    .entry(new_owner)
+                    .or_insert_with(HashSet::new)
+                    .insert(token_identifier.clone());
+            }
+        }
+
+        pub fn operator_token_identifiers(
+            &self,
+            operator: &Principal,
+        ) -> Result<&HashSet<TokenIdentifier>, NftError> {
+            self.operators
+                .get(operator)
+                .ok_or(NftError::OperatorNotFound)
+        }
+
+        pub fn operator_of(
+            &self,
+            token_identifier: &TokenIdentifier,
+        ) -> Result<Option<Principal>, NftError> {
+            self.token_metadata(token_identifier)
+                .map(|token_metadata| token_metadata.operator)
+        }
+
+        pub fn operator_token_metadata(
+            &self,
+            operator: &Principal,
+        ) -> Result<Vec<&TokenMetadata>, NftError> {
+            self.operator_token_identifiers(operator)?
+                .iter()
+                .map(|token_identifier| self.token_metadata(token_identifier))
+                .collect()
+        }
+
+        pub fn update_operator_cache(
+            &mut self,
+            token_identifier: &TokenIdentifier,
+            old_operator: Option<Principal>,
+            new_operator: Option<Principal>,
+        ) {
+            if let Some(old_operator) = old_operator {
+                let old_operator_token_identifiers = self
+                    .operators
+                    .get_mut(&old_operator)
+                    .expect("couldn't find operator");
+                old_operator_token_identifiers.remove(token_identifier);
+                if old_operator_token_identifiers.is_empty() {
+                    self.operators.remove(&old_operator);
+                }
+            }
+            if let Some(new_operator) = new_operator {
+                self.operators
+                    .entry(new_operator)
+                    .or_insert_with(HashSet::new)
+                    .insert(token_identifier.clone());
+            }
+        }
+
+        pub fn approve(
+            &mut self,
+            approved_by: Principal,
+            token_identifier: &TokenIdentifier,
+            new_operator: Option<Principal>,
+        ) {
+            let token_metadata = self
+                .tokens
+                .get_mut(token_identifier)
+                .expect("couldn't find token metadata");
+            token_metadata.operator = new_operator;
+            token_metadata.approved_by = Some(approved_by);
+            token_metadata.approved_at = Some(time());
+        }
+
+        pub fn transfer(
+            &mut self,
+            transferred_by: Principal,
+            token_identifier: &TokenIdentifier,
+            new_owner: Option<Principal>,
+        ) {
+            let token_metadata = self
+                .tokens
+                .get_mut(token_identifier)
+                .expect("couldn't find token metadata");
+            token_metadata.owner = new_owner;
+            token_metadata.transferred_by = Some(transferred_by);
+            token_metadata.transferred_at = Some(time());
+            token_metadata.operator = None;
+        }
+
+        pub fn burn(&mut self, burned_by: Principal, token_identifier: &TokenIdentifier) {
+            let token_metadata = self
+                .tokens
+                .get_mut(token_identifier)
+                .expect("couldn't find token metadata");
+            token_metadata.owner = None;
+            token_metadata.operator = None;
+            token_metadata.is_burned = true;
+            token_metadata.burned_by = Some(burned_by);
+            token_metadata.burned_at = Some(time());
+        }
+
+        pub fn inc_tx(&mut self) -> Nat {
+            self.tx_count += 1;
+            self.tx_count.clone()
+        }
+    }
 }
 
 #[init]
-fn init(args: InitArgs) {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    state.custodians = args
-      .custodians
-      .unwrap_or_else(|| HashSet::from_iter([api::caller()]));
-    state.name = args.name;
-    state.symbol = args.symbol;
-    state.logo = args.logo;
-  });
+#[candid_method(init)]
+fn init(args: Option<InitArgs>) {
+    ledger::with_mut(|ledger| ledger.init_metadata(caller(), args));
 }
 
-#[derive(CandidType, Deserialize)]
-enum Error {
-  Unauthorized,
-  InvalidTokenId,
-  ZeroAddress,
-  Other,
+fn is_canister_custodian() -> Result<(), String> {
+    ledger::with(|ledger| {
+        ledger
+            .metadata()
+            .custodians
+            .contains(&caller())
+            .then(|| ())
+            .ok_or_else(|| "Caller is not an custodian of canister".into())
+    })
 }
 
-impl From<TryFromIntError> for Error {
-  fn from(_: TryFromIntError) -> Self {
-    Self::InvalidTokenId
-  }
+// ==================================================================================================
+// metadata
+// ==================================================================================================
+#[query(name = "name", manual_reply = true)]
+#[candid_method(query, rename = "name")]
+fn name() -> ManualReply<Option<String>> {
+    ledger::with(|ledger| ManualReply::one(ledger.metadata().name.as_ref()))
 }
 
-type Result<T = u128, E = Error> = StdResult<T, E>;
-
-// --------------
-// base interface
-// --------------
-
-#[query(name = "balanceOfDip721")]
-fn balance_of(user: Principal) -> u64 {
-  STATE.with(|state| {
-    state
-      .borrow()
-      .nfts
-      .iter()
-      .filter(|n| n.owner == user)
-      .count() as u64
-  })
+#[query(name = "logo", manual_reply = true)]
+#[candid_method(query, rename = "logo")]
+fn logo() -> ManualReply<Option<String>> {
+    ledger::with(|ledger| ManualReply::one(ledger.metadata().logo.as_ref()))
 }
 
-#[query(name = "ownerOfDip721")]
-fn owner_of(token_id: u64) -> Result<Principal> {
-  STATE.with(|state| {
-    let owner = state
-      .borrow()
-      .nfts
-      .get(usize::try_from(token_id)?)
-      .ok_or(Error::InvalidTokenId)?
-      .owner;
-    Ok(owner)
-  })
+#[query(name = "symbol", manual_reply = true)]
+#[candid_method(query, rename = "symbol")]
+fn symbol() -> ManualReply<Option<String>> {
+    ledger::with(|ledger| ManualReply::one(ledger.metadata().symbol.as_ref()))
 }
 
-#[update(name = "transferFromDip721")]
-fn transfer_from(from: Principal, to: Principal, token_id: u64) -> Result {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    let state = &mut *state;
-    let nft = state
-      .nfts
-      .get_mut(usize::try_from(token_id)?)
-      .ok_or(Error::InvalidTokenId)?;
-    let caller = api::caller();
-    if nft.owner != caller
-      && nft.approved != Some(caller)
-      && !state
-        .operators
-        .get(&from)
-        .map(|s| s.contains(&caller))
-        .unwrap_or(false)
-      && !state.custodians.contains(&caller)
-    {
-      Err(Error::Unauthorized)
-    } else if nft.owner != from {
-      Err(Error::Other)
-    } else {
-      nft.approved = None;
-      nft.owner = to;
-      Ok(state.next_txid())
+#[query(name = "custodians", manual_reply = true)]
+#[candid_method(query, rename = "custodians")]
+fn custodians() -> ManualReply<HashSet<Principal>> {
+    ledger::with(|ledger| ManualReply::one(&ledger.metadata().custodians))
+}
+
+#[query(name = "metadata", manual_reply = true)]
+#[candid_method(query, rename = "metadata")]
+fn metadata() -> ManualReply<Metadata> {
+    ledger::with(|ledger| ManualReply::one(ledger.metadata()))
+}
+
+#[update(name = "setName", guard = "is_canister_custodian")]
+#[candid_method(update, rename = "setName")]
+fn set_name(name: String) {
+    ledger::with_mut(|ledger| ledger.metadata_mut().name = Some(name));
+}
+
+#[update(name = "setLogo", guard = "is_canister_custodian")]
+#[candid_method(update, rename = "setLogo")]
+fn set_logo(logo: String) {
+    ledger::with_mut(|ledger| ledger.metadata_mut().logo = Some(logo));
+}
+
+#[update(name = "setSymbol", guard = "is_canister_custodian")]
+#[candid_method(update, rename = "setSymbol")]
+fn set_symbol(symbol: String) {
+    ledger::with_mut(|ledger| ledger.metadata_mut().symbol = Some(symbol));
+}
+
+#[update(name = "setCustodians", guard = "is_canister_custodian")]
+#[candid_method(update, rename = "setCustodians")]
+fn set_custodians(custodians: HashSet<Principal>) {
+    ledger::with_mut(|ledger| ledger.metadata_mut().custodians = custodians);
+}
+
+// ==================================================================================================
+// stats
+// ==================================================================================================
+/// Returns the total current supply of NFT tokens.
+/// NFTs that are minted and later burned explicitly or sent to the zero address should also count towards totalSupply.
+#[query(name = "totalSupply")]
+#[candid_method(query, rename = "totalSupply")]
+fn total_supply() -> Nat {
+    ledger::with(|ledger| Nat::from(ledger.tokens_count()))
+}
+
+#[query(name = "totalTransactions")]
+#[candid_method(query, rename = "totalTransactions")]
+fn total_transactions() -> Nat {
+    ledger::with(|ledger| ledger.tx_count())
+}
+
+#[query(name = "cycles")]
+#[candid_method(query, rename = "cycles")]
+fn cycles() -> Nat {
+    Nat::from(canister_balance128())
+}
+
+#[query(name = "totalUniqueHolders")]
+#[candid_method(query, rename = "totalUniqueHolders")]
+fn total_unique_holders() -> Nat {
+    ledger::with(|ledger| Nat::from(ledger.owners_count()))
+}
+
+#[query(name = "stats")]
+#[candid_method(query, rename = "stats")]
+fn stats() -> Stats {
+    Stats {
+        total_transactions: total_transactions(),
+        total_supply: total_supply(),
+        cycles: cycles(),
+        total_unique_holders: total_unique_holders(),
     }
-  })
 }
 
-#[update(name = "safeTransferFromDip721")]
-fn safe_transfer_from(from: Principal, to: Principal, token_id: u64) -> Result {
-  if to == MGMT {
-    Err(Error::ZeroAddress)
-  } else {
-    transfer_from(from, to, token_id)
-  }
+// ==================================================================================================
+// supported interfaces
+// ==================================================================================================
+#[query(name = "supportedInterfaces")]
+#[candid_method(query, rename = "supportedInterfaces")]
+fn supported_interfaces() -> Vec<SupportedInterface> {
+    vec![
+        SupportedInterface::Approval,
+        SupportedInterface::Mint,
+        SupportedInterface::Burn,
+    ]
 }
 
-#[query(name = "supportedInterfacesDip721")]
-fn supported_interfaces() -> &'static [InterfaceId] {
-  &[
-    InterfaceId::TransferNotification,
-    // InterfaceId::Approval, // Psychedelic/DIP721#5
-    InterfaceId::Burn,
-    InterfaceId::Mint,
-  ]
+// ==================================================================================================
+// balance
+// ==================================================================================================
+#[query(name = "balanceOf")]
+#[candid_method(query, rename = "balanceOf")]
+fn balance_of(owner: Principal) -> Result<Nat, NftError> {
+    ledger::with(|ledger| {
+        ledger
+            .owner_token_identifiers(&owner)
+            .map(|token_identifiers| Nat::from(token_identifiers.len()))
+    })
 }
 
-#[derive(CandidType, Deserialize, Clone)]
-struct LogoResult {
-  logo_type: Cow<'static, str>,
-  data: Cow<'static, str>,
+// ==================================================================================================
+// token ownership
+// ==================================================================================================
+#[query(name = "ownerOf")]
+#[candid_method(query, rename = "ownerOf")]
+fn owner_of(token_identifier: TokenIdentifier) -> Result<Option<Principal>, NftError> {
+    ledger::with(|ledger| ledger.owner_of(&token_identifier))
 }
 
-#[export_name = "canister_query logoDip721"]
-fn logo() {
-  ic_cdk::setup();
-  STATE.with(|state| call::reply((state.borrow().logo.as_ref().unwrap_or(&DEFAULT_LOGO),)))
+#[query(name = "operatorOf")]
+#[candid_method(query, rename = "operatorOf")]
+fn operator_of(token_identifier: TokenIdentifier) -> Result<Option<Principal>, NftError> {
+    ledger::with(|ledger| ledger.operator_of(&token_identifier))
 }
 
-#[query(name = "nameDip721")]
-fn name() -> String {
-  STATE.with(|state| state.borrow().name.clone())
+#[query(name = "ownerTokenMetadata", manual_reply = true)]
+#[candid_method(query, rename = "ownerTokenMetadata")]
+fn owner_token_metadata(owner: Principal) -> ManualReply<Result<Vec<TokenMetadata>, NftError>> {
+    ledger::with(|ledger| ManualReply::one(ledger.owner_token_metadata(&owner)))
 }
 
-#[query(name = "symbolDip721")]
-fn symbol() -> String {
-  STATE.with(|state| state.borrow().symbol.clone())
+#[query(name = "operatorTokenMetadata", manual_reply = true)]
+#[candid_method(query, rename = "operatorTokenMetadata")]
+fn operator_token_metadata(
+    operator: Principal,
+) -> ManualReply<Result<Vec<TokenMetadata>, NftError>> {
+    ledger::with(|ledger| ManualReply::one(ledger.operator_token_metadata(&operator)))
 }
 
-const DEFAULT_LOGO: LogoResult = LogoResult {
-  data: Cow::Borrowed(include_base64!("logo.png")),
-  logo_type: Cow::Borrowed("image/png"),
-};
-
-#[query(name = "totalSupplyDip721")]
-fn total_supply() -> u64 {
-  STATE.with(|state| state.borrow().nfts.len() as u64)
+#[query(name = "ownerTokenIdentifiers", manual_reply = true)]
+#[candid_method(query, rename = "ownerTokenIdentifiers")]
+fn owner_token_identifiers(
+    owner: Principal,
+) -> ManualReply<Result<Vec<TokenIdentifier>, NftError>> {
+    ledger::with(|ledger| ManualReply::one(ledger.owner_token_identifiers(&owner)))
 }
 
-#[export_name = "canister_query getMetadataDip721"]
-fn get_metadata() {
-  ic_cdk::setup();
-  let token_id = call::arg_data::<(u64,)>().0;
-  let res: Result<()> = STATE.with(|state| {
-    let state = state.borrow();
-    let metadata = &state
-      .nfts
-      .get(usize::try_from(token_id)?)
-      .ok_or(Error::InvalidTokenId)?
-      .metadata;
-    call::reply((Ok::<_, Error>(metadata),));
-    Ok(())
-  });
-  if let Err(e) = res {
-    call::reply((Err::<MetadataDesc, _>(e),));
-  }
+#[query(name = "operatorTokenIdentifiers", manual_reply = true)]
+#[candid_method(query, rename = "operatorTokenIdentifiers")]
+fn operator_token_identifiers(
+    operator: Principal,
+) -> ManualReply<Result<Vec<TokenIdentifier>, NftError>> {
+    ledger::with(|ledger| ManualReply::one(ledger.operator_token_identifiers(&operator)))
 }
 
-#[derive(CandidType)]
-struct ExtendedMetadataResult<'a> {
-  metadata_desc: MetadataDescRef<'a>,
-  token_id: u64,
+// ==================================================================================================
+// token metadata
+// ==================================================================================================
+#[query(name = "tokenMetadata", manual_reply = true)]
+#[candid_method(query, rename = "tokenMetadata")]
+fn token_metadata(
+    token_identifier: TokenIdentifier,
+) -> ManualReply<Result<TokenMetadata, NftError>> {
+    ledger::with(|ledger| ManualReply::one(ledger.token_metadata(&token_identifier)))
 }
 
-#[export_name = "canister_update getMetadataForUserDip721"]
-fn get_metadata_for_user() {
-  ic_cdk::setup();
-  let user = call::arg_data::<(Principal,)>().0;
-  STATE.with(|state| {
-    let state = state.borrow();
-    let metadata: Vec<_> = state
-      .nfts
-      .iter()
-      .filter(|n| n.owner == user)
-      .map(|n| ExtendedMetadataResult {
-        metadata_desc: &n.metadata,
-        token_id: n.id,
-      })
-      .collect();
-    call::reply((metadata,));
-  });
+// ==================================================================================================
+// approved for all
+// ==================================================================================================
+#[query(name = "isApprovedForAll")]
+#[candid_method(query, rename = "isApprovedForAll")]
+fn is_approved_for_all(owner: Principal, operator: Principal) -> Result<bool, NftError> {
+    ledger::with(|ledger| {
+        ledger
+            .owner_token_metadata(&owner)
+            .map(|owner_token_metadata| {
+                owner_token_metadata
+                    .iter()
+                    .all(|token_metadata| token_metadata.operator.eq(&Some(operator)))
+            })
+    })
 }
 
-// ----------------------
-// notification interface
-// ----------------------
+// ==================================================================================================
+// core api
+// ==================================================================================================
+#[update(name = "approve")]
+#[candid_method(update, rename = "approve")]
+fn approve(operator: Principal, token_identifier: TokenIdentifier) -> Result<Nat, NftError> {
+    ledger::with_mut(|ledger| {
+        let caller = caller();
+        operator
+            .ne(&caller)
+            .then(|| ())
+            .ok_or(NftError::SelfApprove)?;
+        ledger
+            .owner_of(&token_identifier)?
+            .eq(&Some(caller))
+            .then(|| ())
+            .ok_or(NftError::UnauthorizedOwner)?;
+        ledger.update_operator_cache(
+            &token_identifier,
+            ledger.operator_of(&token_identifier)?,
+            Some(operator),
+        );
+        ledger.approve(caller, &token_identifier, Some(operator));
 
-#[update(name = "transferFromNotifyDip721")]
-fn transfer_from_notify(from: Principal, to: Principal, token_id: u64, data: Vec<u8>) -> Result {
-  let res = transfer_from(from, to, token_id)?;
-  if let Ok(arg) = Encode!(&api::caller(), &from, &token_id, &data) {
-    // Using call_raw ensures we don't need to await the future for the call to be executed.
-    // Calling an arbitrary function like this means that a malicious recipient could call
-    // transferFromNotifyDip721 in their onDIP721Received function, resulting in an infinite loop.
-    // This will trap eventually, but the transfer will have already been completed and the state-change persisted.
-    // That means the original transfer must reply before that happens, or the caller will be
-    // convinced that the transfer failed when it actually succeeded. So we don't await the call,
-    // so that we'll reply immediately regardless of how long the notification call takes.
-    let _ = api::call::call_raw(to, "onDIP721Received", arg, 0);
-  }
-  Ok(res)
+        insert_sync(IndefiniteEvent {
+            caller,
+            operation: "approve".into(),
+            details: vec![
+                ("operator".into(), DetailValue::from(operator)),
+                (
+                    "token_identifier".into(),
+                    DetailValue::from(token_identifier.to_string()),
+                ),
+            ],
+        });
+
+        Ok(ledger.inc_tx() - 1)
+    })
 }
 
-#[update(name = "safeTransferFromNotifyDip721")]
-fn safe_transfer_from_notify(
-  from: Principal,
-  to: Principal,
-  token_id: u64,
-  data: Vec<u8>,
-) -> Result {
-  if to == MGMT {
-    Err(Error::ZeroAddress)
-  } else {
-    transfer_from_notify(from, to, token_id, data)
-  }
-}
-
-// ------------------
-// approval interface
-// ------------------
-
-#[update(name = "approveDip721")]
-fn approve(user: Principal, token_id: u64) -> Result {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    let state = &mut *state;
-    let caller = api::caller();
-    let nft = state
-      .nfts
-      .get_mut(usize::try_from(token_id)?)
-      .ok_or(Error::InvalidTokenId)?;
-    if nft.owner != caller
-      && nft.approved != Some(caller)
-      && !state
-        .operators
-        .get(&user)
-        .map(|s| s.contains(&caller))
-        .unwrap_or(false)
-      && !state.custodians.contains(&caller)
-    {
-      Err(Error::Unauthorized)
-    } else {
-      nft.approved = Some(user);
-      Ok(state.next_txid())
-    }
-  })
-}
-
-#[update(name = "setApprovalForAllDip721")]
-fn set_approval_for_all(operator: Principal, is_approved: bool) -> Result {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    let caller = api::caller();
-    if operator != caller {
-      let operators = state.operators.entry(caller).or_default();
-      if operator == MGMT {
-        if !is_approved {
-          operators.clear();
-        } else {
-          // cannot enable everyone as an operator
+/// since we've supported single operator per owner only
+/// so when `is_approved` is false that mean set all caller's nfts to None regardless of `operator`
+/// otherwise set all caller's nfts to `operator`
+#[update(name = "setApprovalForAll")]
+#[candid_method(update, rename = "setApprovalForAll")]
+fn set_approval_for_all(operator: Principal, is_approved: bool) -> Result<Nat, NftError> {
+    ledger::with_mut(|ledger| {
+        let caller = caller();
+        operator
+            .ne(&caller)
+            .then(|| ())
+            .ok_or(NftError::SelfApprove)?;
+        let owner_token_identifiers = ledger.owner_token_identifiers(&caller)?.clone();
+        for token_identifier in owner_token_identifiers {
+            let old_operator = ledger.operator_of(&token_identifier)?;
+            let new_operator = if is_approved { Some(operator) } else { None };
+            ledger.update_operator_cache(&token_identifier, old_operator, new_operator);
+            ledger.approve(caller, &token_identifier, new_operator);
         }
-      } else {
-        if is_approved {
-          operators.insert(operator);
-        } else {
-          operators.remove(&operator);
-        }
-      }
-    }
-    Ok(state.next_txid())
-  })
+
+        insert_sync(IndefiniteEvent {
+            caller,
+            operation: "setApprovalForAll".into(),
+            details: vec![
+                ("operator".into(), DetailValue::from(operator)),
+                (
+                    "is_approved".into(),
+                    if is_approved {
+                        DetailValue::True
+                    } else {
+                        DetailValue::False
+                    },
+                ),
+            ],
+        });
+
+        Ok(ledger.inc_tx() - 1)
+    })
 }
 
-// #[query(name = "getApprovedDip721")] // Psychedelic/DIP721#5
-fn _get_approved(token_id: u64) -> Result<Principal> {
-  STATE.with(|state| {
-    let approved = state
-      .borrow()
-      .nfts
-      .get(usize::try_from(token_id)?)
-      .ok_or(Error::InvalidTokenId)?
-      .approved
-      .unwrap_or_else(api::caller);
-    Ok(approved)
-  })
+#[update(name = "transfer")]
+#[candid_method(update, rename = "transfer")]
+fn transfer(to: Principal, token_identifier: TokenIdentifier) -> Result<Nat, NftError> {
+    ledger::with_mut(|ledger| {
+        let caller = caller();
+        to.ne(&caller).then(|| ()).ok_or(NftError::SelfTransfer)?;
+        let old_owner = ledger.owner_of(&token_identifier)?;
+        let old_operator = ledger.operator_of(&token_identifier)?;
+        old_owner
+            .eq(&Some(caller))
+            .then(|| ())
+            .ok_or(NftError::UnauthorizedOwner)?;
+        ledger.update_owner_cache(&token_identifier, old_owner, Some(to));
+        ledger.update_operator_cache(&token_identifier, old_operator, None);
+        ledger.transfer(caller, &token_identifier, Some(to));
+
+        insert_sync(IndefiniteEvent {
+            caller,
+            operation: "transfer".into(),
+            details: vec![
+                ("owner".into(), DetailValue::from(caller)),
+                ("to".into(), DetailValue::from(to)),
+                (
+                    "token_identifier".into(),
+                    DetailValue::from(token_identifier.to_string()),
+                ),
+            ],
+        });
+
+        Ok(ledger.inc_tx() - 1)
+    })
 }
 
-#[query(name = "isApprovedForAllDip721")]
-fn is_approved_for_all(operator: Principal) -> bool {
-  STATE.with(|state| {
-    state
-      .borrow()
-      .operators
-      .get(&api::caller())
-      .map(|s| s.contains(&operator))
-      .unwrap_or(false)
-  })
+#[update(name = "transferFrom")]
+#[candid_method(update, rename = "transferFrom")]
+fn transfer_from(
+    owner: Principal,
+    to: Principal,
+    token_identifier: TokenIdentifier,
+) -> Result<Nat, NftError> {
+    ledger::with_mut(|ledger| {
+        let caller = caller();
+        owner.ne(&to).then(|| ()).ok_or(NftError::SelfTransfer)?;
+        let old_owner = ledger.owner_of(&token_identifier)?;
+        let old_operator = ledger.operator_of(&token_identifier)?;
+        old_owner
+            .eq(&Some(owner))
+            .then(|| ())
+            .ok_or(NftError::UnauthorizedOwner)?;
+        old_operator
+            .eq(&Some(caller))
+            .then(|| ())
+            .ok_or(NftError::UnauthorizedOperator)?;
+        ledger.update_owner_cache(&token_identifier, old_owner, Some(to));
+        ledger.update_operator_cache(&token_identifier, old_operator, None);
+        ledger.transfer(caller, &token_identifier, Some(to));
+
+        insert_sync(IndefiniteEvent {
+            caller,
+            operation: "transferFrom".into(),
+            details: vec![
+                ("owner".into(), DetailValue::from(owner)),
+                ("to".into(), DetailValue::from(to)),
+                (
+                    "token_identifier".into(),
+                    DetailValue::from(token_identifier.to_string()),
+                ),
+            ],
+        });
+
+        Ok(ledger.inc_tx() - 1)
+    })
 }
 
-// --------------
-// mint interface
-// --------------
-
-#[update(name = "mintDip721")]
+#[update(name = "mint", guard = "is_canister_custodian")]
+#[candid_method(update, rename = "mint")]
 fn mint(
-  to: Principal,
-  metadata: MetadataDesc,
-  blob_content: Vec<u8>,
-) -> Result<MintResult, ConstrainedError> {
-  let (txid, tkid) = STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    if !state.custodians.contains(&api::caller()) {
-      return Err(ConstrainedError::Unauthorized);
-    }
-    let new_id = state.nfts.len() as u64;
-    let nft = Nft {
-      owner: to,
-      approved: None,
-      id: new_id,
-      metadata,
-      content: blob_content,
-    };
-    state.nfts.push(nft);
-    Ok((state.next_txid(), new_id))
-  })?;
-  http::add_hash(tkid);
-  Ok(MintResult {
-    id: txid,
-    token_id: tkid,
-  })
+    to: Principal,
+    token_identifier: TokenIdentifier,
+    properties: Vec<(String, GenericValue)>,
+) -> Result<Nat, NftError> {
+    ledger::with_mut(|ledger| {
+        let caller = caller();
+        ledger
+            .is_token_existed(&token_identifier)
+            .not()
+            .then(|| ())
+            .ok_or(NftError::ExistedNFT)?;
+        ledger.add_token_metadata(
+            token_identifier.clone(),
+            TokenMetadata {
+                token_identifier: token_identifier.clone(),
+                owner: Some(to),
+                operator: None,
+                properties,
+                is_burned: false,
+                minted_at: time(),
+                minted_by: caller,
+                transferred_at: None,
+                transferred_by: None,
+                approved_at: None,
+                approved_by: None,
+                burned_at: None,
+                burned_by: None,
+            },
+        );
+        ledger.update_owner_cache(&token_identifier, None, Some(to));
+
+        insert_sync(IndefiniteEvent {
+            caller,
+            operation: "mint".into(),
+            details: vec![
+                ("to".into(), DetailValue::from(to)),
+                (
+                    "token_identifier".into(),
+                    DetailValue::from(token_identifier.to_string()),
+                ),
+            ],
+        });
+
+        Ok(ledger.inc_tx() - 1)
+    })
 }
 
-// --------------
-// burn interface
-// --------------
+#[update(name = "burn")]
+#[candid_method(update, rename = "burn")]
+fn burn(token_identifier: TokenIdentifier) -> Result<Nat, NftError> {
+    ledger::with_mut(|ledger| {
+        let caller = caller();
+        let old_owner = ledger.owner_of(&token_identifier)?;
+        old_owner
+            .eq(&Some(caller))
+            .then(|| ())
+            .ok_or(NftError::UnauthorizedOwner)?;
+        let old_operator = ledger.operator_of(&token_identifier)?;
+        ledger.update_owner_cache(&token_identifier, old_owner, None);
+        ledger.update_operator_cache(&token_identifier, old_operator, None);
+        ledger.burn(caller, &token_identifier);
 
-#[update(name = "burnDip721")]
-fn burn(token_id: u64) -> Result {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    let nft = state
-      .nfts
-      .get_mut(usize::try_from(token_id)?)
-      .ok_or(Error::InvalidTokenId)?;
-    if nft.owner != api::caller() {
-      Err(Error::Unauthorized)
-    } else {
-      nft.owner = MGMT;
-      Ok(state.next_txid())
-    }
-  })
+        insert_sync(IndefiniteEvent {
+            caller,
+            operation: "burn".into(),
+            details: vec![(
+                "token_identifier".into(),
+                DetailValue::from(token_identifier.to_string()),
+            )],
+        });
+
+        Ok(ledger.inc_tx() - 1)
+    })
 }
 
-#[derive(CandidType, Deserialize, Default)]
-struct State {
-  nfts: Vec<Nft>,
-  custodians: HashSet<Principal>,
-  operators: HashMap<Principal, HashSet<Principal>>, // owner to operators
-  logo: Option<LogoResult>,
-  name: String,
-  symbol: String,
-  txid: u128,
+// ==================================================================================================
+// upgrade
+// ==================================================================================================
+/// NOTE:
+/// If you plan to store gigabytes of state and upgrade the code,
+/// Using stable memory as the main storage is a good option to consider
+#[pre_upgrade]
+fn pre_upgrade() {
+    ledger::with(|ledger| {
+        if let Err(err) = ic_cdk::storage::stable_save::<(&ledger::Ledger, cap_sdk::Archive)>((
+            ledger,
+            cap_sdk::archive(),
+        )) {
+            trap(&format!(
+                "An error occurred when saving to stable memory (pre_upgrade): {:?}",
+                err
+            ));
+        };
+    })
 }
 
-#[derive(CandidType, Deserialize)]
-struct Nft {
-  owner: Principal,
-  approved: Option<Principal>,
-  id: u64,
-  metadata: MetadataDesc,
-  content: Vec<u8>,
+#[post_upgrade]
+fn post_upgrade() {
+    ledger::with_mut(|ledger| {
+        match ic_cdk::storage::stable_restore::<(ledger::Ledger, cap_sdk::Archive)>() {
+            Ok((ledger_store, cap_store)) => {
+                *ledger = ledger_store;
+                ledger.metadata_mut().upgraded_at = time();
+                cap_sdk::from_archive(cap_store);
+            }
+            Err(err) => {
+                trap(&format!(
+                    "An error occurred when loading from stable memory (post_upgrade): {:?}",
+                    err
+                ));
+            }
+        }
+    })
 }
 
-type MetadataDesc = Vec<MetadataPart>;
-type MetadataDescRef<'a> = &'a [MetadataPart];
+#[cfg(any(target_arch = "wasm32", test))]
+fn main() {}
 
-#[derive(CandidType, Deserialize)]
-struct MetadataPart {
-  purpose: MetadataPurpose,
-  key_val_data: HashMap<String, MetadataVal>,
-  data: Vec<u8>,
+#[cfg(not(any(target_arch = "wasm32", test)))]
+fn main() {
+    std::print!("{}", export_candid());
 }
 
-#[derive(CandidType, Deserialize, PartialEq)]
-enum MetadataPurpose {
-  Preview,
-  Rendered,
+#[query(name = "__get_candid_interface_tmp_hack")]
+fn export_candid() -> String {
+    ic_cdk::export::candid::export_service!();
+    __export_service()
 }
 
-#[derive(CandidType, Deserialize)]
-struct MintResult {
-  token_id: u64,
-  id: u128,
-}
-
-#[allow(clippy::enum_variant_names)]
-#[derive(CandidType, Deserialize)]
-enum MetadataVal {
-  TextContent(String),
-  BlobContent(Vec<u8>),
-  NatContent(u128),
-  Nat8Content(u8),
-  Nat16Content(u16),
-  Nat32Content(u32),
-  Nat64Content(u64),
-}
-
-impl State {
-  fn next_txid(&mut self) -> u128 {
-    let txid = self.txid;
-    self.txid += 1;
-    txid
-  }
-}
-
-#[derive(CandidType, Deserialize)]
-enum InterfaceId {
-  Approval,
-  TransactionHistory,
-  Mint,
-  Burn,
-  TransferNotification,
-}
-
-#[derive(CandidType, Deserialize)]
-enum ConstrainedError {
-  Unauthorized,
-}
-
-#[update]
-fn set_name(name: String) -> Result<()> {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    if state.custodians.contains(&api::caller()) {
-      state.name = name;
-      Ok(())
-    } else {
-      Err(Error::Unauthorized)
-    }
-  })
-}
-
-#[update]
-fn set_symbol(sym: String) -> Result<()> {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    if state.custodians.contains(&api::caller()) {
-      state.symbol = sym;
-      Ok(())
-    } else {
-      Err(Error::Unauthorized)
-    }
-  })
-}
-
-#[update]
-fn set_logo(logo: Option<LogoResult>) -> Result<()> {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    if state.custodians.contains(&api::caller()) {
-      state.logo = logo;
-      Ok(())
-    } else {
-      Err(Error::Unauthorized)
-    }
-  })
-}
-
-#[update]
-fn set_custodian(user: Principal, custodian: bool) -> Result<()> {
-  STATE.with(|state| {
-    let mut state = state.borrow_mut();
-    if state.custodians.contains(&api::caller()) {
-      if custodian {
-        state.custodians.insert(user);
-      } else {
-        state.custodians.remove(&user);
-      }
-      Ok(())
-    } else {
-      Err(Error::Unauthorized)
-    }
-  })
-}
-
-#[query]
-fn is_custodian(principal: Principal) -> bool {
-  STATE.with(|state| state.borrow().custodians.contains(&principal))
-}
+// ROADMAP:
+// - notification
+// - consider support: multiple operators per owner
