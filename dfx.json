@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "canisters": {
+    "uamagicals_nft_container": {
+      "type": "rust",
+      "candid": "uamagicals-nft-container.did",
+      "package": "uamagicals_nft_container"
+    },
+    "nft_0": {
+      "dependencies": [
+        "uamagicals_nft_container"
+      ],
+      "source": [
+        "assets"
+      ],
+      "type": "assets"
+    }
+  },
+  "dfx": "0.10.1"
+}
