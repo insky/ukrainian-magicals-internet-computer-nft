@@ -40,10 +40,16 @@ dfx canister $NETWORK call uamagicals_nft_container mint \
           TextContent = \"#1 Kyiv\"
         }
       };
-       record {
+      record {
         \"description\";
         variant {
           TextContent = \"${DESCRIPTION}\"
+        }
+      };
+      record {
+        \"arexport\";
+        variant {
+          TextContent = \"https://dydxz-fqaaa-aaaag-aanla-cai.raw.ic0.app/1.arexport\"
         }
       };
     }
@@ -72,10 +78,16 @@ dfx canister $NETWORK call uamagicals_nft_container mint \
           TextContent = \"#2 Kalush\"
         }
       };
-       record {
+      record {
         \"description\";
         variant {
           TextContent = \"${DESCRIPTION}\"
+        }
+      };
+      record {
+        \"arexport\";
+        variant {
+          TextContent = \"https://dydxz-fqaaa-aaaag-aanla-cai.raw.ic0.app/2.arexport\"
         }
       };
     }
@@ -104,10 +116,16 @@ dfx canister $NETWORK call uamagicals_nft_container mint \
           TextContent = \"#3 Lviv\"
         }
       };
-       record {
+      record {
         \"description\";
         variant {
           TextContent = \"${DESCRIPTION}\"
+        }
+      };
+      record {
+        \"arexport\";
+        variant {
+          TextContent = \"https://dydxz-fqaaa-aaaag-aanla-cai.raw.ic0.app/2.arexport\"
         }
       };
     }
