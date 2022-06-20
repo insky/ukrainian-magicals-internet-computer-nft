@@ -28,3 +28,13 @@ dfx canister call uamagicals_nft_container mint \
     }
   )"
 ```
+
+#### Set name
+```
+dfx canister --network ic call uamagicals_nft_container setName "(\"Ukrainian Magicals\")"
+```
+
+#### Set symbol
+```
+dfx canister --network ic call uamagicals_nft_container setSymbol "(\"UAMNFT\")"
+```

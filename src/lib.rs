@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use cap_sdk::{handshake, insert_sync, DetailValue, IndefiniteEvent};
 use ic_cdk::api::call::ManualReply;
 use ic_cdk::api::{caller, canister_balance128, time, trap};
