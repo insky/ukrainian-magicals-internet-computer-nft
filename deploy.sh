@@ -58,6 +58,12 @@ dfx canister $NETWORK call uamagicals_nft_container mint \
           TextContent = \"https://www.instagram.com/ar/1037867120437159/\"
         }
       };
+      record {
+        \"qrLink\";
+        variant {
+          TextContent = \"https://dydxz-fqaaa-aaaag-aanla-cai.raw.ic0.app/1-qrcode.png\"
+        }
+      };
     }
   )"
 
@@ -102,6 +108,12 @@ dfx canister $NETWORK call uamagicals_nft_container mint \
           TextContent = \"https://www.instagram.com/ar/392422939602960/\"
         }
       };
+      record {
+        \"qrLink\";
+        variant {
+          TextContent = \"https://dydxz-fqaaa-aaaag-aanla-cai.raw.ic0.app/2-qrcode.png\"
+        }
+      };
     }
   )"
 
@@ -144,6 +156,12 @@ dfx canister $NETWORK call uamagicals_nft_container mint \
         \"arViewLink\";
         variant {
           TextContent = \"https://www.instagram.com/ar/500413538502681/\"
+        }
+      };
+      record {
+        \"qrLink\";
+        variant {
+          TextContent = \"https://dydxz-fqaaa-aaaag-aanla-cai.raw.ic0.app/3-qrcode.png\"
         }
       };
     }

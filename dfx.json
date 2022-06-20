@@ -10,6 +10,9 @@
       "dependencies": [
         "uamagicals_nft_container"
       ],
+      "frontend": {
+        "entrypoint": "assets/src/index.html"
+      },
       "source": [
         "assets"
       ],
