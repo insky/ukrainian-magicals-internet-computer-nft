@@ -1,5 +1,5 @@
 # Ukrainian Magicals NFT
-https://ukrainianmagicals.com/
+[https://ukrainianmagicals.fun/](https://ukrainianmagicals.fun/)
 
 Ukrainian Magicals - unique NFT collection created by Ukrainian augmented reality team called Magicals within the framework of [Supernova
 Internet Computer Web3 Hackathon](https://supernova.devpost.com/?ref_content=default&ref_feature=challenge&ref_medium=portfolio)
